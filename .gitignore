@@ -1,0 +1,23 @@
+# Credentials
+.env
+
+# Your personal Wandrer KMZ export (re-download from wandrer.earth regularly)
+wandrer.kmz
+
+# Generated route output
+routes/
+
+# OSM data (large binary, download from geofabrik.de if needed)
+*.osm.pbf
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.tmp.*
