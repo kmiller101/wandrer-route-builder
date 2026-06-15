@@ -95,10 +95,18 @@ VALHALLA = "https://valhalla1.openstreetmap.de"
 #   areas (dead ends, cul-de-sacs) that inflate waypoint count without adding value.
 #   0 = keep all segments.
 #
-# CHUNK_K: spatial clustering for large zones that produce >50 waypoints after dedup.
-#   1 = standard single-pass (hard cap at 50 waypoints if exceeded)
-#   2-3 = split into K clusters, optimize each independently, chain together.
-#   Each cluster must have ≤50 points (Valhalla matrix hard limit).
+# WAYPOINT_MODE: how to derive TSP waypoints from segment geometry.
+#   "endpoints" — use both endpoints (intersections) of each segment. More reliable
+#                 coverage: routing through endpoint A then B forces Valhalla to
+#                 traverse the street between them. Produces more waypoints than
+#                 midpoints, so pair with CHUNK_K="auto" for large zones.
+#   "midpoints" — legacy: one midpoint per segment. Fine for short straight segments;
+#                 can miss coverage on long or curved streets.
+#
+# CHUNK_K: spatial clustering for zones that produce >50 waypoints after dedup.
+#   "auto" = set K automatically so each cluster stays under 45 waypoints.
+#   1      = standard single-pass (truncates at 50 if exceeded — use for small zones).
+#   2-4    = explicit cluster count (each cluster must be ≤50 for Valhalla matrix).
 #
 # LOOP: True = route returns to start (required for out-and-back car/transit trips).
 
@@ -114,7 +122,8 @@ BBOX = (42.416, 42.430, -83.220, -83.199)
 
 DEDUP_M = 140
 MIN_SEG_M = 50
-CHUNK_K = 1   # spatial chunks: 1=standard (≤50 wpts), 2-3=for dense areas with many segments
+WAYPOINT_MODE = "endpoints"  # "endpoints" (recommended) or "midpoints"
+CHUNK_K = "auto"             # "auto" or integer (1=single-pass, 2-4=explicit chunks)
 SLUG = "my-route"
 ROUTE_NAME = "My Route"
 LOOP = True
@@ -613,22 +622,34 @@ if FILTER_MODE == "bbox":
 else:
     print(f"  {len(near_segments)} untraveled segments within {RADIUS_MI} mi of ({ZONE_LAT},{ZONE_LON}) ({near_mi:.2f} mi){min_note}")
 
-# Step 3: Compute segment midpoints and deduplicate
-# Each segment's midpoint is used as the TSP waypoint for that segment.
-# Deduplication merges nearby waypoints (parallel streets, close segments) to stay
-# within Valhalla's 50-node matrix cap and avoid redundant routing.
-midpoints = [(sum(p[0] for p in s) / len(s), sum(p[1] for p in s) / len(s)) for s in near_segments]
-midpoints = deduplicate(midpoints, min_dist_m=DEDUP_M)
-if CHUNK_K <= 1 and len(midpoints) > 50:
-    midpoints = midpoints[:50]
-print(f"Waypoints after dedup: {len(midpoints)}")
+# Step 3: Extract waypoints from segment geometry and deduplicate.
+# "endpoints" mode uses both intersections of each segment — routing through A then B
+# forces Valhalla to traverse the street between them, giving better coverage than a
+# single midpoint approximation (which can be satisfied by a parallel street).
+# "midpoints" is the legacy fallback: one centroid per segment.
+if WAYPOINT_MODE == "endpoints":
+    raw_points = []
+    for s in near_segments:
+        raw_points.append(s[0])
+        raw_points.append(s[-1])
+else:
+    raw_points = [(sum(p[0] for p in s) / len(s), sum(p[1] for p in s) / len(s))
+                  for s in near_segments]
+midpoints = deduplicate(raw_points, min_dist_m=DEDUP_M)
+print(f"Waypoints after dedup ({WAYPOINT_MODE}): {len(midpoints)}")
 
-# Step 4: Solve TSP to find the optimal visit order
-# If CHUNK_K > 1 and waypoints exceed 50, use spatial clustering to bypass
-# Valhalla's matrix limit. Otherwise run the standard single-pass 2-opt.
-if CHUNK_K > 1 and len(midpoints) > 50:
-    print(f"Running chunked 2-opt TSP ({CHUNK_K} spatial clusters)...")
-    ordered = chunked_tour(midpoints, CHUNK_K, loop=LOOP)
+# Step 4: Solve TSP to find the optimal visit order.
+# CHUNK_K="auto" sizes clusters so each stays under 45 nodes (Valhalla cap is 50;
+# leaving headroom avoids 400 errors on borderline cases).
+chunk_k = CHUNK_K
+if chunk_k == "auto":
+    chunk_k = max(1, math.ceil(len(midpoints) / 45))
+    if chunk_k > 1:
+        print(f"Auto CHUNK_K={chunk_k} ({len(midpoints)} waypoints)")
+
+if chunk_k > 1 and len(midpoints) > 45:
+    print(f"Running chunked 2-opt TSP ({chunk_k} spatial clusters)...")
+    ordered = chunked_tour(midpoints, chunk_k, loop=LOOP)
 else:
     print("Fetching walking distance matrix from Valhalla...")
     dist = valhalla_matrix(midpoints)
