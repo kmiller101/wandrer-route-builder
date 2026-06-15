@@ -671,4 +671,113 @@ print(f"GPX written: {OUTPUT_GPX} ({len(track_points)} trackpoints)")
 
 write_fit(track_points, maneuvers, ROUTE_NAME, OUTPUT_FIT)
 print(f"FIT written: {OUTPUT_FIT}")
+
+# Step 7: OSM safety review — check for restricted access and physical barriers
+# Queries the Overpass API for two classes of issues within the route bbox:
+#   Access restrictions: foot=no, motorway/trunk, private roads
+#   Physical barriers:   gates, bollards, construction, unpaved surfaces
+# Any feature within BARRIER_SNAP_M of a KMZ segment midpoint is flagged.
+# Includes a Google Maps link for each flag so the runner can do a visual check.
+print("\nRunning OSM safety review...")
+
+_OVERPASS = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+_BARRIER_SNAP_M = 50
+
+def _nearest_seg_dist(lat, lon, segs):
+    return min(
+        haversine_m(lat, lon, sum(p[0] for p in s)/len(s), sum(p[1] for p in s)/len(s))
+        for s in segs
+    )
+
+def _osm_review(bbox_segs, lat_min, lat_max, lon_min, lon_max):
+    bb = f"{lat_min},{lon_min},{lat_max},{lon_max}"
+    query = f"""[out:json][timeout:60];
+(
+  way["foot"="no"]({bb});
+  way["foot"="private"]({bb});
+  way["access"="no"]["highway"]({bb});
+  way["access"="private"]["highway"]({bb});
+  way["highway"="motorway"]({bb});
+  way["highway"="motorway_link"]({bb});
+  way["highway"="trunk"]({bb});
+  way["highway"="trunk_link"]({bb});
+  node["barrier"]({bb});
+  way["barrier"]({bb});
+  way["highway"="construction"]({bb});
+  way["construction"]({bb});
+  way["surface"="unpaved"]["highway"~"residential|service|tertiary"]({bb});
+  way["surface"="gravel"]["highway"~"residential|service|tertiary"]({bb});
+  way["surface"="dirt"]({bb});
+);
+out geom tags;"""
+    try:
+        resp = requests.post(_OVERPASS, data={"data": query}, timeout=90)
+        resp.raise_for_status()
+        elements = resp.json().get("elements", [])
+    except Exception as e:
+        print(f"  OSM review unavailable: {e}")
+        return
+
+    access_flags, barrier_flags, other_flags = [], [], []
+    for el in elements:
+        tags = el.get("tags", {})
+        if el["type"] == "node":
+            lat, lon = el["lat"], el["lon"]
+        elif el["type"] == "way":
+            geom = el.get("geometry", [])
+            if not geom:
+                continue
+            lat = sum(p["lat"] for p in geom) / len(geom)
+            lon = sum(p["lon"] for p in geom) / len(geom)
+        else:
+            continue
+
+        dist = _nearest_seg_dist(lat, lon, bbox_segs)
+        if dist > _BARRIER_SNAP_M:
+            continue
+
+        hw      = tags.get("highway", "")
+        foot    = tags.get("foot", "")
+        access  = tags.get("access", "")
+        barrier = tags.get("barrier", "")
+        surface = tags.get("surface", "")
+        name    = tags.get("name", "(unnamed)")
+        gmaps   = f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
+
+        detail = " | ".join(f"{k}={v}" for k, v in [
+            ("highway", hw), ("foot", foot), ("access", access),
+            ("barrier", barrier), ("surface", surface),
+        ] if v)
+        entry = f"  ({lat:.5f},{lon:.5f}) {dist:3.0f}m  {name}  [{detail}]\n    {gmaps}"
+
+        if hw in ("motorway","motorway_link","trunk","trunk_link") or foot in ("no","private") or access in ("no","private"):
+            access_flags.append(entry)
+        elif barrier or hw == "construction" or "construction" in tags:
+            barrier_flags.append(entry)
+        elif surface in ("unpaved","gravel","dirt","grass","sand"):
+            other_flags.append(entry)
+
+    if not access_flags and not barrier_flags and not other_flags:
+        print("  OSM review: no issues found — route looks clean.")
+        return
+
+    if access_flags:
+        print(f"\n  ACCESS RESTRICTIONS near route ({len(access_flags)}):")
+        for f in access_flags:
+            print(f)
+    if barrier_flags:
+        print(f"\n  PHYSICAL BARRIERS near route ({len(barrier_flags)}):")
+        for f in barrier_flags:
+            print(f)
+    if other_flags:
+        print(f"\n  SURFACE ISSUES near route ({len(other_flags)}):")
+        for f in other_flags:
+            print(f)
+    print("\n  Verify flagged locations via the Google Maps links above.")
+
+if near_segments:
+    _lats = [p[0] for s in near_segments for p in s]
+    _lons = [p[1] for s in near_segments for p in s]
+    _osm_review(near_segments, min(_lats), max(_lats), min(_lons), max(_lons))
+
 print("Done.")
