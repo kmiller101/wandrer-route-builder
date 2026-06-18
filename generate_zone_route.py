@@ -237,25 +237,34 @@ def nearest_neighbor(dist, start):
     return tour
 
 
-def two_opt_improve(tour, dist, loop):
+def two_opt_improve(tour, dist, loop, max_passes=200):
     """
     2-opt local search improvement.
 
     Repeatedly checks all pairs of edges (i-1,i) and (j, j+1). If reversing the
     segment between i and j shortens the tour, applies the reversal. Stops when
     no improving swap exists (local optimum).
+
+    max_passes bounds the outer loop. Real-world walking-distance matrices aren't
+    always perfectly symmetric (one-way crossings, slightly different forward/
+    reverse costs), so a reversal can occasionally look like an "improvement" in
+    both directions, oscillating forever with a too-tight epsilon. The 1e-4 mi
+    (~0.5ft) epsilon ignores noise-level deltas, and max_passes guarantees
+    termination even if oscillation still occurs.
     """
     n = len(tour)
     improved = True
-    while improved:
+    passes = 0
+    while improved and passes < max_passes:
         improved = False
+        passes += 1
         for i in range(1, n - 1):
             for j in range(i + 1, n):
                 if not loop and j == n - 1:
                     continue
                 a, b = tour[i - 1], tour[i]
                 c, d = tour[j], tour[(j + 1) % n]
-                if dist[a][c] + dist[b][d] < dist[a][b] + dist[c][d] - 1e-9:
+                if dist[a][c] + dist[b][d] < dist[a][b] + dist[c][d] - 1e-4:
                     tour[i: j + 1] = tour[i: j + 1][::-1]
                     improved = True
     return tour
