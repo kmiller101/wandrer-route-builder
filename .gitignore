@@ -7,6 +7,9 @@ wandrer.kmz
 # Generated route output
 routes/
 
+# Memoized Valhalla matrix/route responses (regenerable, keyed on request payload hash)
+.valhalla_cache/
+
 # OSM data (large binary, download from geofabrik.de if needed)
 *.osm.pbf
 

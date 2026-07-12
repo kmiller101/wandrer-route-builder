@@ -132,6 +132,62 @@ name and use its centroid. Always sanity-check the resulting route's actual stre
 the intended neighborhood (see "Verifying route labels" below) — it's easy to grab the wrong
 coordinates and end up generating a route somewhere else entirely.
 
+### Additional pipeline stages (opt-in flags in the CONFIG block)
+
+Since the initial release, `generate_zone_route.py` grew several extra stages beyond the
+core parse → dedup → 2-opt → route loop above. All are configured in the same CONFIG block;
+most default to `True`/on since they only improve accuracy or route quality, never make a
+route worse:
+
+- **Or-opt local search** (always on, no flag) — after 2-opt converges, relocates chains of
+  1–3 consecutive waypoints to a better position in the tour. Runs inside `local_search()`,
+  alternating with 2-opt until neither improves. Pure gain on top of 2-opt; adds negligible
+  runtime.
+- **`USE_SEGMENT_CHAINING` / `SEGMENT_CHAIN_FACTOR`** — discounts TSP matrix legs between
+  waypoints that came from the *same* KMZ segment, so the tour visits a segment's
+  start→mid→end consecutively instead of interleaving them with other segments (which forces
+  Valhalla to backtrack through already-covered streets). Keep the factor > 0 — at 0 the TSP
+  can't distinguish monotone traversal from backtracking.
+- **`USE_COVERAGE_REPAIR` / `REPAIR_MAX_DIST_M` / `REPAIR_DETOUR_MULT` / `REPAIR_MAX_ROUNDS`**
+  — after the initial route, checks every candidate segment that scored below
+  `COVER_MIN_FRAC` (see `seg_coverage.py`) against the actual routed track. If splicing the
+  segment's worst-covered point into the tour costs less than `REPAIR_DETOUR_MULT`× the
+  segment's own length, it's accepted and the route re-generated. Runs in a bounded loop
+  (`REPAIR_MAX_ROUNDS`) since one pass doesn't always clear every gap.
+- **`USE_ACCESS_PREFILTER` / `ACCESS_PREFILTER_M` / `ACCESS_PREFILTER_MIN_FRAC`** — before
+  the TSP, queries Overpass for foot-inaccessible ways (private roads, `foot=no`,
+  motorway/trunk links) in the bbox and drops any KMZ segment where at least
+  `ACCESS_PREFILTER_MIN_FRAC` of its own length lies within `ACCESS_PREFILTER_M` of one.
+  Uses a fractional, resampled check (not just the segment's midpoint) so a long legitimate
+  street isn't dropped just because one end brushes a private driveway. Keeps the coverage
+  report honest — it only scores segments the route could actually reach.
+- **`USE_GEOMETRY_DENSIFY` / `DENSIFY_MAX_GAP_M` / `DENSIFY_SNAP_TOL_M`** — KMZ segments can
+  have long straight-line gaps between vertices. For any gap over `DENSIFY_MAX_GAP_M`, looks
+  for a real OSM way whose geometry both endpoints snap to within `DENSIFY_SNAP_TOL_M`, and
+  splices in that way's own denser vertices. Only improves coverage-measurement accuracy —
+  waypoint extraction (start/mid/end) is unaffected.
+- **`USE_ADAPTIVE_DEDUP_M`** (off by default) — instead of the fixed `DEDUP_M`, queries
+  Overpass for the bbox's actual parallel-street spacing and sets dedup to 70% of the
+  tightest gap. Opt-in because it changes which waypoints survive dedup, and therefore the
+  TSP itself — turn on if `DEDUP_M` seems to be merging or splitting streets incorrectly for
+  a given area's grid spacing.
+- **`FORCE_START_POINT`** (default `None`) — forces the loop's start/end to a specific
+  `(lat, lon)`, e.g. a parking lot. Added to the waypoint pool like `FORCED_WAYPOINTS`, then
+  the closed tour is rotated to begin there — free in distance *only if the point is already
+  near the route*. **Reset this to `None` before generating a route in a different area** —
+  a stale value left over from a previous zone will silently force a large detour out to it
+  and back, inflating the route with no error or warning.
+- **Valhalla request caching** — `valhalla_matrix()` and each maneuver-routing call are
+  memoized to `.valhalla_cache/`, keyed on a hash of the exact request payload. Repeat runs
+  with the same waypoint set (common while tuning `RADIUS_MI` or A/B testing a flag) skip the
+  routing engine entirely. Never expires automatically; delete the directory by hand if your
+  OSM data changes.
+
+Coverage-related stages (`seg_coverage.py`) share one rule between this script and any
+post-run stripping script you build: a segment counts as covered when ≥90% of its length is
+within 25m of the track polyline (resampled every 10m, so straight 2-vertex blocks and curved
+streets are both measured accurately).
+
 ### `generate_from_point.py` — anchored to a specific start point
 Use this when you need the loop to start/end at an exact GPS coordinate (e.g., where you
 park, or a specific landmark). It forces that point into the waypoint set, runs the 2-opt
@@ -286,10 +342,12 @@ truth is always Wandrer's own next sync of your data, not a local approximation.
 wandrer-route-builder/
   generate_zone_route.py      # area-based route generation (use this first)
   generate_from_point.py      # anchored to a specific GPS start point
+  seg_coverage.py             # shared segment-coverage rule (used by generate_zone_route.py)
   wandrer.kmz                 # YOUR current untraveled-streets export — re-sync regularly (gitignored)
   .env                        # Strava API credentials (gitignored)
   .env.example                # credential template
   requirements.txt
+  .valhalla_cache/            # memoized Valhalla matrix/route responses (gitignored, safe to delete)
 
 routes/                       # generated output (gitignored)
   my-route.fit                # Garmin course file (load this onto watch)
@@ -305,7 +363,18 @@ routes/                       # generated output (gitignored)
 |---|---|
 | `parse_kmz_linestrings` | Extract every `<LineString>` from a `wandrer-*.kmz` MultiGeometry export |
 | `deduplicate` | Remove midpoints closer than `min_dist_m` meters |
-| `valhalla_matrix` | Fetch NxN walking-distance matrix (max 50 nodes) |
-| `best_2opt_tour` | Try all NN starting points, 2-opt improve each, return shortest |
+| `valhalla_matrix` | Fetch NxN walking-distance matrix (max 50 nodes), memoized to `.valhalla_cache/` |
+| `best_2opt_tour` | Try all NN starting points, 2-opt + Or-opt improve each, return shortest |
+| `or_opt_improve` / `local_search` | Relocate 1–3-waypoint chains to a better tour position; alternates with 2-opt until neither improves |
+| `apply_segment_chain_discount` | Discount TSP legs between waypoints from the same KMZ segment so the tour visits them consecutively |
+| `estimate_street_spacing_m` / `compute_adaptive_dedup_m` | Measure real parallel-street spacing from Overpass, derive an adaptive `DEDUP_M` |
+| `prefilter_inaccessible_segments` | Drop KMZ segments that are mostly on foot-inaccessible OSM ways before the TSP even sees them |
+| `densify_segment` / `densify_all_segments` | Splice in real OSM vertices across long straight-line KMZ gaps for more accurate coverage measurement |
+| `coverage_repair_pass` | Post-route: splice in cheap detours to recover segments that scored just under the coverage threshold |
+| `coverage_and_completions_report` | Score the routed track against candidate segments and report which neighborhoods it fully completes |
 | `valhalla_route_with_maneuvers` | Route waypoints in order, extract turn instructions |
 | `write_gpx` / `write_fit` | Write GPX trackfile / FIT course (with `course_point` turn records) |
+
+`seg_coverage.py` (shared module): `TrackIndex` (grid-indexed track polyline for fast
+point-to-polyline distance), `covered_fraction` / `segment_covered` (the ≥90%-of-length-within-25m
+coverage rule used by both the repair pass and any post-run stripping script you build).
